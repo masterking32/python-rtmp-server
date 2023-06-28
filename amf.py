@@ -2,7 +2,9 @@
 #
 # Implementation of
 # http://opensource.adobe.com/wiki/download/attachments/1114283/amf0_spec_121207.pdf
+# https://github.com/diederickh/ofxFlashCommunication/blob/master/doc/amf0_spec_121207.pdf
 # http://opensource.adobe.com/wiki/download/attachments/1114283/amf3_spec_121207.pdf
+# https://github.com/diederickh/ofxFlashCommunication/blob/master/doc/amf3_spec_05_05_08.pdf
 
 import struct
 import datetime
