@@ -148,13 +148,13 @@ class RTMPServer:
         # elif msg_type_id == RTMP_TYPE_FLEX_OBJECT:
         #     self.handle_flex_shared_object_message(payload)
         elif msg_type_id == RTMP_TYPE_FLEX_MESSAGE:
-            self.handle_amf0_invoke_message(rtmp_packet)
+            self.parse_amf0_invoke_message(rtmp_packet)
         # elif msg_type_id == RTMP_TYPE_DATA:
         #     self.handle_amf0_data_message(payload)
         # elif msg_type_id == RTMP_TYPE_SHARED_OBJECT:
         #     self.handle_amf0_shared_object_message(payload)
         elif msg_type_id == RTMP_TYPE_INVOKE:
-            self.handle_amf0_invoke_message(rtmp_packet)
+            self.parse_amf0_invoke_message(rtmp_packet)
         # elif msg_type_id == RTMP_TYPE_METADATA:
         #     self.handle_metadata_message(payload)
         else:
@@ -186,7 +186,7 @@ class RTMPServer:
         self.peer_bandwidth = bandwidth
         self.logger.info("Updated peer bandwidth: %d, Limit type: %d", self.peer_bandwidth, limit_type)
 
-    def handle_amf0_invoke_message(self, rtmp_packet):
+    def parse_amf0_invoke_message(self, rtmp_packet):
         offset = 1 if rtmp_packet['header']['type'] == RTMP_TYPE_FLEX_MESSAGE else 0
         payload = rtmp_packet['payload'][offset:rtmp_packet['header']['length']]
         amfReader = amf.AMF0(payload)
@@ -209,6 +209,7 @@ class RTMPServer:
             pass
 
         self.logger.info("Command %s", inst)
+        return inst
 
     async def start_server(self):
         server = await asyncio.start_server(
