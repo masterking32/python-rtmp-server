@@ -19,6 +19,9 @@ class Object(object):
     def __init__(self, **kwargs):
         for key, val in list(kwargs.items()):
             setattr(self, key, val)
+            
+    def __len__(self):
+        return len(self.__dict__)
 
 
 class Class:
