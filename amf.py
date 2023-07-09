@@ -295,7 +295,8 @@ class AMF0(object):
     def readEcmaArray(self):
         len_ignored = self.data.read_u32()
         obj, key = self._created(dict()), self.readString()
-        while key != '' or self.data.peek() != chr(AMF0.OBJECT_END):
+        
+        while key != '' and self.data.peek() != chr(AMF0.OBJECT_END):
             obj[int(key) if key.isdigit() else key] = self.read()
             key = self.readString()
         self.data.read(1)  # discard OBJECT_END

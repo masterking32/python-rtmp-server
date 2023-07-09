@@ -4,6 +4,7 @@ import amf
 import common
 import struct
 from typing import Optional
+import time
 
 # Config
 LogLevel = logging.INFO
@@ -31,6 +32,7 @@ RTMP_CHUNK_TYPE_2 = 2 # 3-bytes: delta(3)
 RTMP_CHUNK_TYPE_3 = 3 # 0-byte
 
 PING_SIZE, DEFAULT_CHUNK_SIZE, HIGH_WRITE_CHUNK_SIZE, PROTOCOL_CHANNEL_ID = 1536, 128, 4096, 2
+LiveUsers = {}
 
 class DisconnectClientException(Exception):
     pass
@@ -66,6 +68,13 @@ class RTMPServer:
         
         self.lastWriteHeaders = dict()
         self.nextChannelId = PROTOCOL_CHANNEL_ID + 1
+        self.streams = 0
+        self._time0 = time.time()
+        self.stream_mode = 'live'
+        
+        self.streamPath = ''
+        self.publishStreamId = 0
+        self.publishStreamPath = ''
 
     async def handle_client(self, reader, writer):
         # Get client IP address
@@ -91,7 +100,8 @@ class RTMPServer:
                 if not chunk_data:
                     break  # Client disconnected
                 rtmp_packet = self.parse_rtmp_packet(chunk_data)
-                await self.handle_rtmp_packet(rtmp_packet)
+                if rtmp_packet != None:
+                    await self.handle_rtmp_packet(rtmp_packet)
 
             except asyncio.TimeoutError:
                 self.logger.error("Connection timeout. Closing connection: %s", self.client_ip)
@@ -105,6 +115,11 @@ class RTMPServer:
                 await writer.wait_closed()
                 return
             
+            except ConnectionAbortedError as e:
+                self.logger.error("Connection aborted by client: %s", self.client_ip)
+                writer.close()
+                return
+        
             except Exception as e:
                 self.logger.error("An error occurred: %s", str(e))
                 self.logger.info("Disconnecting client: %s", self.client_ip)
@@ -158,10 +173,10 @@ class RTMPServer:
             # Handle Type 3 chunk
             # No need to include any header information
             self.logger.info("FMT 3!")
-            return
+            return None
         else:
             self.logger.info("Unsupported FMT packet!")
-            return
+            return None
 
         # Create rtmpPacket object
         rtmp_packet = {
@@ -212,8 +227,8 @@ class RTMPServer:
         elif msg_type_id == RTMP_TYPE_FLEX_MESSAGE:
             invoke_message = self.parse_amf0_invoke_message(rtmp_packet)
             await self.handle_invoke_message(invoke_message)
-        # elif msg_type_id == RTMP_TYPE_DATA:
-        #     self.handle_amf0_data_message(payload)
+        elif msg_type_id == RTMP_TYPE_DATA:
+            await self.handle_amf_data(rtmp_packet)
         # elif msg_type_id == RTMP_TYPE_SHARED_OBJECT:
         #     self.handle_amf0_shared_object_message(payload)
         elif msg_type_id == RTMP_TYPE_INVOKE:
@@ -223,7 +238,6 @@ class RTMPServer:
         #     self.handle_metadata_message(payload)
         else:
             self.logger.warning("Unsupported RTMP packet type: %s", msg_type_id)
-
 
     def handle_chunk_size_message(self, payload):
         # Handle Chunk Size message
@@ -252,9 +266,74 @@ class RTMPServer:
 
     async def handle_invoke_message(self, invoke):
         if invoke['cmd'] == 'connect':
+            self.logger.info("Received connect invoke")
             await self.handle_connect_command(invoke)
+        elif invoke['cmd'] == 'releaseStream' or invoke['cmd'] == 'FCPublish':
+            self.logger.info("Received %s invoke", invoke['cmd'])
+            return
+        elif invoke['cmd'] == 'createStream':
+            self.logger.info("Received createStream invoke")
+            await self.response_createStream(invoke)
+        elif invoke['cmd'] == 'publish':
+            self.logger.info("Received publish invoke")
+            await self.handle_publish(invoke)
         else:
             self.logger.info("Unsupported invoke command %s!", invoke['cmd'])
+    
+    async def handle_publish(self, invoke):
+        self.stream_mode = 'live' if len(invoke['args']) < 2 else invoke['args'][1]  # live, record, append
+        self.streamPath = invoke['args'][0]
+        self.publishStreamId = int(invoke['packet']['header']['stream_id'])
+        self.publishStreamPath = "/" + self.app + "/" + self.streamPath.split("?")[0]
+        if(self.streamPath == None or self.streamPath == ''):
+            self.logger.info("Stream key is empty!")
+            await self.sendStatusMessage(self.publishStreamId, "error", "NetStream.Publish.BadName", "Stream stream key is empty!")
+            raise DisconnectClientException()
+        
+        if self.stream_mode == 'live':
+            if LiveUsers.get(self.app) is not None:
+                self.logger.info("Stream already publishing!")
+                await self.sendStatusMessage(self.publishStreamId, "error", "NetStream.Publish.BadName", "Stream already publishing")
+                raise DisconnectClientException()
+        
+            LiveUsers[self.app] = {
+                'stream_mode': self.stream_mode,
+                'stream_path': self.streamPath,
+                'publish_stream_id': self.publishStreamId,
+                'app': self.app,
+            }
+
+        self.logger.info("Publish Request Mode: %s, App: %s, Path: %s, publishStreamPath: %s, StreamID: %s", self.stream_mode, self.app, self.streamPath, self.publishStreamPath, str(self.publishStreamId))
+        await self.sendStatusMessage(self.publishStreamId, "status", "NetStream.Publish.Start", f"{self.publishStreamPath} is now published.")
+
+    async def sendStatusMessage(self, sid, level, code, description):
+        response = common.Command(
+        name='onStatus',
+        id=sid,
+        tm=self.relativeTime(),
+        args=[
+            amf.Object(
+                level=level,
+                code=code,
+                description=description,
+                details=None)])
+        
+        message = response.toMessage()
+        self.logger.info("Sending onStatus response!")
+        await self.writeMessage(message)
+        
+    async def response_createStream(self, invoke):
+        self.streams = self.streams + 1;
+        response = common.Command(
+            name='_result',
+            id=invoke['id'],
+            tm=self.relativeTime(),
+            type=common.Message.RPC,
+            args=[self.streams])
+
+        message = response.toMessage()
+        self.logger.info("Sending createStream response!")
+        await self.writeMessage(message)
 
     async def handle_connect_command(self, invoke):
         if hasattr(invoke['cmdData'], 'app'):
@@ -428,6 +507,29 @@ class RTMPServer:
 
         return chunks
 
+    async def handle_amf_data(self, rtmp_packet):
+        offset = 1 if rtmp_packet['header']['type'] == RTMP_TYPE_FLEX_MESSAGE else 0
+        payload = rtmp_packet['payload'][offset:rtmp_packet['header']['length']]
+        amfReader = amf.AMF0(payload)
+        inst = {}
+        inst['type'] = rtmp_packet['header']['type']
+        inst['time'] = rtmp_packet['header']['timestamp']
+        inst['packet'] = rtmp_packet
+        inst['cmd'] = amfReader.read()  # first field is command name
+        if inst['cmd'] == '@setDataFrame':
+            inst['type'] = amfReader.read() # onMetaData
+            self.logger.info("AMF Data type: %s", inst['type'])
+            if inst['type'] != 'onMetaData':
+                return
+            
+            inst['dataObj'] = amfReader.read()  # third is obj data
+            if(inst['dataObj'] != None):
+                    self.logger.info("Command Data %s", inst['dataObj'])
+        else:
+            self.logger.info("Unsupported RTMP_TYPE_DATA cmd, CMD: %s", inst['cmd'])
+        
+        #TODO: handle Meta Datas!
+
     def parse_amf0_invoke_message(self, rtmp_packet):
         offset = 1 if rtmp_packet['header']['type'] == RTMP_TYPE_FLEX_MESSAGE else 0
         payload = rtmp_packet['payload'][offset:rtmp_packet['header']['length']]
@@ -454,6 +556,9 @@ class RTMPServer:
 
         self.logger.info("Command %s", inst)
         return inst
+    
+    def relativeTime(self):
+        return int(1000 * (time.time() - self._time0))
 
     async def start_server(self):
         server = await asyncio.start_server(
