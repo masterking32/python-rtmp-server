@@ -5,6 +5,7 @@ import common
 import struct
 from typing import Optional
 import time
+import handshake
 
 # Config
 LogLevel = logging.INFO
@@ -31,7 +32,7 @@ RTMP_CHUNK_TYPE_1 = 1 # 7-bytes: delta(3) + length(3) + stream type(1)
 RTMP_CHUNK_TYPE_2 = 2 # 3-bytes: delta(3)
 RTMP_CHUNK_TYPE_3 = 3 # 0-byte
 
-PING_SIZE, DEFAULT_CHUNK_SIZE, HIGH_WRITE_CHUNK_SIZE, PROTOCOL_CHANNEL_ID = 1536, 128, 4096, 2
+PROTOCOL_CHANNEL_ID = 2
 LiveUsers = {}
 
 class DisconnectClientException(Exception):
@@ -75,9 +76,12 @@ class RTMPServer:
         self.streamPath = ''
         self.publishStreamId = 0
         self.publishStreamPath = ''
+        self.FirstPackets = {}
+        self.CacheState = 0
+        self.lastWriteHeadersForChunk = {}  # Stores the last received header information for each chunk stream ID
+
 
     async def handle_client(self, reader, writer):
-        # Get client IP address
         self.reader = reader
         self.writer = writer
         
@@ -86,7 +90,7 @@ class RTMPServer:
 
         # Perform RTMP handshake
         try:
-            await asyncio.wait_for(self.perform_handshake(reader, writer), timeout=5)
+            await asyncio.wait_for(self.perform_handshake(), timeout=5)
         except asyncio.TimeoutError:
             self.logger.error("Handshake timeout. Closing connection: %s", self.client_ip)
             writer.close()
@@ -96,52 +100,121 @@ class RTMPServer:
         # Process RTMP messages
         while True:
             try:
-                chunk_data = await reader.read(self.chunk_size)
-                if not chunk_data:
-                    break  # Client disconnected
-                rtmp_packet = self.parse_rtmp_packet(chunk_data)
-                if rtmp_packet != None:
-                    await self.handle_rtmp_packet(rtmp_packet)
+                chunk_full = await self.get_chunk_data()
 
+                if chunk_full == None:
+                    continue
+
+                rtmp_packet = self.parse_rtmp_packet(chunk_full)
+
+                if rtmp_packet == None:
+                    continue
+
+                await self.handle_rtmp_packet(rtmp_packet)
             except asyncio.TimeoutError:
                 self.logger.error("Connection timeout. Closing connection: %s", self.client_ip)
-                writer.close()
-                await writer.wait_closed()
-                return
+                break
             
             except DisconnectClientException:
                 self.logger.info("Disconnecting client: %s", self.client_ip)
-                writer.close()
-                await writer.wait_closed()
-                return
+                break
             
             except ConnectionAbortedError as e:
                 self.logger.error("Connection aborted by client: %s", self.client_ip)
-                writer.close()
-                return
+                break
         
             except Exception as e:
                 self.logger.error("An error occurred: %s", str(e))
-                self.logger.info("Disconnecting client: %s", self.client_ip)
-                writer.close()
-                await writer.wait_closed()
-                return
+                break
 
         # Close the client connection
         writer.close()
         await writer.wait_closed()
         self.logger.info("Client disconnected: %s", self.client_ip)
 
-    async def perform_handshake(self, reader, writer):
-        # Read and echo C0C1
-        c0c1_data = await asyncio.wait_for(reader.readexactly(1537), timeout=5)
-        writer.write(c0c1_data)
-        await writer.drain()
+    async def get_chunk_data(self):
+        try:
+            chunk_data = await self.reader.readexactly(1)
+            if not chunk_data:
+                return None
+            chunk_full = bytearray(chunk_data)
+            fmt = (chunk_data[0] & 0b11000000) >> 6
+            cid = chunk_data[0] & 0b00111111
 
-        # Read and echo C2
-        c2_data = await asyncio.wait_for(reader.readexactly(1536), timeout=5)
-        writer.write(c2_data)
-        await writer.drain()
+            if fmt == RTMP_CHUNK_TYPE_0:
+                # Full header
+                header_data = await self.reader.readexactly(11)
+                chunk_full += header_data
+                msg_length = int.from_bytes(header_data[3:6], byteorder='big')
+                self.lastWriteHeadersForChunk[cid] = {
+                    'msg_length': msg_length
+                }
+            elif fmt == RTMP_CHUNK_TYPE_1:
+                # No message stream ID
+                header_data = await self.reader.readexactly(7)
+                chunk_full += header_data
+                msg_length = int.from_bytes(header_data[3:6], byteorder='big')
+                self.lastWriteHeadersForChunk[cid] = {
+                    'msg_length': msg_length
+                }
+            elif fmt == RTMP_CHUNK_TYPE_2:
+                # No message stream ID or message length
+                header_data = await self.reader.readexactly(3)
+                chunk_full += header_data
+                if cid in self.lastWriteHeadersForChunk:
+                    msg_length = self.lastWriteHeadersForChunk[cid]['msg_length']
+                else:
+                    self.logger.info("Invalid FMT 2 packet: Missing previous header information")
+                    return None
+                msg_length = len(chunk_data) + msg_length - len(header_data)
+            elif fmt == RTMP_CHUNK_TYPE_3:
+                # No header
+                self.logger.info("FMT 3!")
+                payload = await self.reader.read(self.chunk_size)
+                chunk_full += payload
+                return chunk_full
+
+            if msg_length > self.chunk_size:
+                payload = await self.reader.readexactly(self.chunk_size)
+                while msg_length > len(payload):
+                    remaining_length = msg_length - len(payload)
+                    await self.reader.readexactly(1)
+                    chunk_data = await self.reader.readexactly(min(self.chunk_size, remaining_length))
+                    payload += chunk_data
+                    remaining_length -= len(chunk_data)
+                chunk_full += payload
+            else:
+                payload = await self.reader.readexactly(msg_length)
+                chunk_full += payload
+            return chunk_full
+        except:
+            raise DisconnectClientException()
+
+
+    async def perform_handshake(self):
+        c0_data = await self.reader.readexactly(1)
+        if c0_data != bytes([0x03]) and c0_data != bytes([0x06]):
+            self.writer.close()
+            await self.writer.wait_closed()
+            self.logger.info("Invalid Handshake, Client disconnected: %s", self.client_ip)
+
+        c1_data = await self.reader.readexactly(1536)
+        clientType = bytes([3])
+        messageFormat = handshake.detectClientMessageFormat(c1_data)
+        if messageFormat == handshake.MESSAGE_FORMAT_0:
+            await self.send(clientType)
+            s1_data = c1_data
+            s2_data = c1_data
+            await self.send(c1_data)
+            await self.reader.readexactly(len(s1_data))
+            await self.send(s2_data)
+        else:
+            s1_data = handshake.generateS1(messageFormat)
+            s2_data = handshake.generateS2(messageFormat, c1_data)
+            data = clientType + s1_data + s2_data
+            self.writer.write(data)
+            s1_data = await self.reader.readexactly(len(s1_data))
+
         self.logger.info("Handshake done!")
 
     def parse_rtmp_packet(self, chunk_data):
@@ -205,11 +278,11 @@ class RTMPServer:
         # Extract information from rtmp_packet and process as needed
         msg_type_id = rtmp_packet["header"]["type"]
         payload = rtmp_packet["payload"]
-
+    
         if msg_type_id == RTMP_TYPE_SET_CHUNK_SIZE:
             self.handle_chunk_size_message(payload)
         elif msg_type_id == RTMP_TYPE_ACKNOWLEDGEMENT:
-            self.handle_bytes_read_report(payload)
+            await self.handle_bytes_read_report(payload)
         # elif msg_type_id == RTMP_PACKET_TYPE_CONTROL:
         #     self.handle_control_message(payload)
         elif msg_type_id == RTMP_TYPE_WINDOW_ACKNOWLEDGEMENT_SIZE:
@@ -244,12 +317,6 @@ class RTMPServer:
         new_chunk_size = int.from_bytes(payload, byteorder='big')
         self.chunk_size = new_chunk_size
         self.logger.info("Updated chunk size: %d", self.chunk_size)
-    
-    def handle_bytes_read_report(self, payload):
-        # Handle Acknowledgement message (Bytes Read Report)
-        # bytes_read = int.from_bytes(payload, byteorder='big')
-        # self.logger.info("Bytes read: %d", bytes_read)
-        self.logger.info("RTMP_TYPE_ACKNOWLEDGEMENT")
 
     def handle_window_acknowledgement_size(self, payload):
         # Handle Window Acknowledgement Size message
@@ -287,7 +354,7 @@ class RTMPServer:
         self.publishStreamPath = "/" + self.app + "/" + self.streamPath.split("?")[0]
         if(self.streamPath == None or self.streamPath == ''):
             self.logger.info("Stream key is empty!")
-            await self.sendStatusMessage(self.publishStreamId, "error", "NetStream.Publish.BadName", "Stream stream key is empty!")
+            await self.sendStatusMessage(self.publishStreamId, "error", "NetStream.publish.Unauthorized", "Authorization required.")
             raise DisconnectClientException()
         
         if self.stream_mode == 'live':
@@ -364,7 +431,7 @@ class RTMPServer:
 
     async def send(self, data):
         # Perform asynchronous sending operation
-        self.logger.info("Sending data: %s", data)
+        # self.logger.info("Sending data: %s", data)
         self.writer.write(data)
         await self.writer.drain()
 
@@ -384,12 +451,20 @@ class RTMPServer:
         await self.send(rtmp_buffer)
         self.logger.info("Set bandwidth to %s", size)
 
+    async def sendACK(self, size):
+        rtmpBuffer = bytearray.fromhex('02000000000004030000000000000000')
+        rtmpBuffer[12:16] = size.to_bytes(4, 'big')
+        await self.send(rtmpBuffer) 
 
     async def set_chunk_size(self, out_chunk_size):
         rtmp_buffer = bytearray.fromhex("02000000000004010000000000000000")
         struct.pack_into('>I', rtmp_buffer, 12, out_chunk_size)
         await self.send(bytes(rtmp_buffer))
 
+    async def handle_bytes_read_report(self, payload):
+        bytes_read = int.from_bytes(payload, byteorder='big')
+        self.logger.info("Bytes read: %d", bytes_read)
+        await self.sendACK(bytes_read)  # Send ACK message with the bytes_read value
         
     async def respond_connect(self, tid):
         response = common.Command()
@@ -409,7 +484,6 @@ class RTMPServer:
         await self.writeMessage(message)
 
     async def writeMessage(self, message):
-
         if message.streamId in self.lastWriteHeaders:
             header = self.lastWriteHeaders[message.streamId]
         else:
@@ -538,9 +612,9 @@ class RTMPServer:
         inst['type'] = rtmp_packet['header']['type']
         inst['time'] = rtmp_packet['header']['timestamp']
         inst['packet'] = rtmp_packet
-        inst['cmd'] = amfReader.read()  # first field is command name
         
         try:
+            inst['cmd'] = amfReader.read()  # first field is command name
             if rtmp_packet['header']['type'] == RTMP_TYPE_FLEX_MESSAGE or rtmp_packet['header']['type'] == RTMP_TYPE_INVOKE:
                 inst['id'] = amfReader.read()  # second field *may* be message id
                 inst['cmdData'] = amfReader.read()  # third is command data
