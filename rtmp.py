@@ -101,8 +101,7 @@ class RTMPServer:
             await asyncio.wait_for(self.perform_handshake(client_state.id), timeout=5)
         except asyncio.TimeoutError:
             self.logger.error("Handshake timeout. Closing connection: %s", self.client_states[client_state.id].client_ip)
-            writer.close()
-            await writer.wait_closed()
+            await self.disconnect(client_state.id)
             return
 
         # Process RTMP messages
@@ -135,10 +134,21 @@ class RTMPServer:
                 self.logger.error("An error occurred: %s", str(e))
                 break
 
+        self.disconnect(client_state.id)
+        
+    async def disconnect(self, client_id):
         # Close the client connection
-        writer.close()
-        await writer.wait_closed()
-        self.logger.info("Client disconnected: %s", self.client_states[client_state.id].client_ip)
+        client_state = self.client_states[client_id]
+        client_ip = client_state.client_ip
+        del self.client_states[client_id]
+        for app in LiveUsers:
+            if LiveUsers[app]['client_id'] == client_id:
+                del LiveUsers[app]
+                break
+        
+        client_state.writer.close()
+        await client_state.writer.wait_closed()
+        self.logger.info("Client disconnected: %s", client_ip)
 
     async def get_chunk_data(self, client_id):
         client_state = self.client_states[client_id]
@@ -197,7 +207,6 @@ class RTMPServer:
                 chunk_full += payload
             return chunk_full
         except:
-            print("AAAAAAAAAAAAAAAAAAAAA")
             raise DisconnectClientException()
 
 
@@ -350,7 +359,7 @@ class RTMPServer:
         if invoke['cmd'] == 'connect':
             self.logger.info("Received connect invoke")
             await self.handle_connect_command(client_id, invoke)
-        elif invoke['cmd'] == 'releaseStream' or invoke['cmd'] == 'FCPublish':
+        elif invoke['cmd'] == 'releaseStream' or invoke['cmd'] == 'FCPublish' or invoke['cmd'] == 'getStreamLength':
             self.logger.info("Received %s invoke", invoke['cmd'])
             return
         elif invoke['cmd'] == 'createStream':
@@ -380,6 +389,7 @@ class RTMPServer:
                 raise DisconnectClientException()
         
             LiveUsers[client_state.app] = {
+                'client_id': client_id,
                 'stream_mode': client_state.stream_mode,
                 'stream_path': client_state.streamPath,
                 'publish_stream_id': client_state.publishStreamId,
