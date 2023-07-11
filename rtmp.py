@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import amf
+import av
 import common
 import struct
 from typing import Optional
@@ -92,7 +93,7 @@ class ClientState:
         self.Bitrate = 0
 
         
-        self.isReceiveAudio = False;
+        self.isFirstAudioReceived = False;
         self.isReceiveVideo = False;
         self.aacSequenceHeader = None;
         self.avcSequenceHeader = None
@@ -347,8 +348,8 @@ class RTMPServer:
             self.handle_window_acknowledgement_size(client_id, payload)
         elif msg_type_id == RTMP_TYPE_SET_PEER_BANDWIDTH:
             self.handle_set_peer_bandwidth(client_id, payload)
-        # elif msg_type_id == RTMP_TYPE_AUDIO:
-        #     self.handle_audio_data(payload)
+        elif msg_type_id == RTMP_TYPE_AUDIO:
+            await self.handle_audio_data(client_id, rtmp_packet)
         # elif msg_type_id == RTMP_TYPE_VIDEO:
         #     self.handle_video_data(payload)
         # elif msg_type_id == RTMP_TYPE_FLEX_STREAM:
@@ -370,7 +371,51 @@ class RTMPServer:
         else:
             self.logger.debug("Unsupported RTMP packet type: %s", msg_type_id)
 
-    def handle_chunk_size_message(self,client_id, payload):
+    async def handle_audio_data(self, client_id, rtmp_packet):
+        client_state = self.client_states[client_id]
+        payload = rtmp_packet['payload']
+        sound_format = (payload[0] >> 4) & 0x0f
+        sound_type = payload[0] & 0x01
+        sound_size = (payload[0] >> 1) & 0x01
+        sound_rate = (payload[0] >> 2) & 0x03
+
+        if client_state.audioCodec == 0:
+            client_state.audioCodec = sound_format;
+            client_state.audioCodecName = av.AUDIO_CODEC_NAME[sound_format];
+            client_state.audioSampleRate = av.AUDIO_SOUND_RATE[sound_rate];
+            client_state.audioChannels = sound_type + 1;
+    
+            if sound_format == 4:
+                # Nellymoser 16 kHz
+                client_state.audioSampleRate = 16000
+            elif sound_format in (5, 7, 8):
+                # Nellymoser 8 kHz | G.711 A-law | G.711 mu-law
+                client_state.audioSampleRate = 8000
+            elif sound_format == 11:
+                # Speex
+                client_state.audioSampleRate = 16000
+            elif sound_format == 14:
+                # MP3 8 kHz
+                client_state.audioSampleRate = 8000
+
+        if (sound_format == 10 or sound_format == 13) and payload[1] == 0:
+            # cache AAC sequence header
+            client_state.isFirstAudioReceived = True
+            client_state.aacSequenceHeader = payload
+
+            if sound_format == 10:
+                info = av.read_aac_specific_config(client_state.aacSequenceHeader)
+                client_state.audioProfileName = av.get_aac_profile_name(info)
+                client_state.audioSampleRate = info['sample_rate']
+                client_state.audioChannels = info['sample_rate']
+            else:
+                client_state.audioSampleRate = 48000
+                client_state.audioChannels = payload[11]
+        
+        #write for players
+
+
+    def handle_chunk_size_message(self, client_id, payload):
         # Handle Chunk Size message
         new_chunk_size = int.from_bytes(payload, byteorder='big')
         self.client_states[client_id].chunk_size = new_chunk_size
