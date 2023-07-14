@@ -34,24 +34,32 @@ RTMP_CHUNK_TYPE_1 = 1 # 7-bytes: delta(3) + length(3) + stream type(1)
 RTMP_CHUNK_TYPE_2 = 2 # 3-bytes: delta(3)
 RTMP_CHUNK_TYPE_3 = 3 # 0-byte
 
+# RTMP channel constants
 RTMP_CHANNEL_PROTOCOL = 2
 RTMP_CHANNEL_INVOKE = 3
 RTMP_CHANNEL_AUDIO = 4
 RTMP_CHANNEL_VIDEO = 5
 RTMP_CHANNEL_DATA = 6
 
+# Protocol channel ID
 PROTOCOL_CHANNEL_ID = 2
+
+# Dictionary to store live users
 LiveUsers = {}
+# Dictionary to store player users
 PlayerUsers = {}
+
+# Custom exception for disconnecting clients
 class DisconnectClientException(Exception):
     pass
 
+# Class representing the state of a connected client
 class ClientState:
     def __init__(self):
         self.id = str(uuid.uuid4())
         self.client_ip = '0.0.0.0'
 
-        # RTMP
+        # RTMP properties
         self.chunk_size = 128  # Default chunk size
         self.out_chunk_size = 4096 # Default out chunk size
         self.window_acknowledgement_size = 5000000  # Default window acknowledgement size
@@ -92,10 +100,9 @@ class ClientState:
         self.videoFps = 0
         self.Bitrate = 0
 
-        
-        self.isFirstAudioReceived = False;
-        self.isReceiveVideo = False;
-        self.aacSequenceHeader = None;
+        self.isFirstAudioReceived = False
+        self.isReceiveVideo = False
+        self.aacSequenceHeader = None
         self.avcSequenceHeader = None
         self.audioCodec = 0
         self.audioCodecName = ''
@@ -106,9 +113,11 @@ class ClientState:
         self.videoCount = 0
         self.videoLevel = 0
 
+# RTMP server class
 class RTMPServer:
     def __init__(self, host='0.0.0.0', port=1935):
         # Socket
+        # Server socket properties
         self.host = host
         self.port = port
         self.client_states = {}
@@ -118,6 +127,7 @@ class RTMPServer:
         self.logger.addHandler(logging.StreamHandler())
 
     async def handle_client(self, reader, writer):
+        # Create a new client state for each connected client
         client_state = ClientState()
         self.client_states[client_state.id] = client_state
         self.client_states[client_state.id].clientID = client_state.id
@@ -188,6 +198,7 @@ class RTMPServer:
         self.logger.info("Client disconnected: %s", client_ip)
 
     async def get_chunk_data(self, client_id):
+        # Read a chunk of data from the client
         client_state = self.client_states[client_id]
         try:
             chunk_data = await client_state.reader.readexactly(1)
@@ -248,6 +259,7 @@ class RTMPServer:
 
 
     async def perform_handshake(self, client_id):
+        # Perform the RTMP handshake with the client
         client_state = self.client_states[client_id]
         
         c0_data = await client_state.reader.readexactly(1)
@@ -276,7 +288,7 @@ class RTMPServer:
         self.logger.debug("Handshake done!")
 
     def parse_rtmp_packet(self, chunk_data):
-        # Parse RTMP packet
+        # Parse an RTMP packet from the chunk data
         fmt = (chunk_data[0] & 0b11000000) >> 6
         if fmt == RTMP_CHUNK_TYPE_0:
             cid = chunk_data[0] & 0b00111111
@@ -329,8 +341,8 @@ class RTMPServer:
         return rtmp_packet
 
     async def handle_rtmp_packet(self, client_id, rtmp_packet):
+        # Handle an RTMP packet from the client
         # client_state = self.client_states[client_id]
-        # Handle RTMP packet
         self.logger.debug("Received RTMP packet:")
         self.logger.debug("  RTMP Packet: %s", rtmp_packet)
 
@@ -350,8 +362,8 @@ class RTMPServer:
             self.handle_set_peer_bandwidth(client_id, payload)
         elif msg_type_id == RTMP_TYPE_AUDIO:
             await self.handle_audio_data(client_id, rtmp_packet)
-        # elif msg_type_id == RTMP_TYPE_VIDEO:
-        #     self.handle_video_data(payload)
+        elif msg_type_id == RTMP_TYPE_VIDEO:
+            await self.handle_video_data(client_id, rtmp_packet)
         # elif msg_type_id == RTMP_TYPE_FLEX_STREAM:
         #     self.handle_flex_stream_message(payload)
         # elif msg_type_id == RTMP_TYPE_FLEX_OBJECT:
@@ -371,6 +383,17 @@ class RTMPServer:
         else:
             self.logger.debug("Unsupported RTMP packet type: %s", msg_type_id)
 
+    async def handle_video_data(self, client_id, rtmp_packet):
+        # Handle video data in an RTMP packet
+        client_state = self.client_states[client_id]
+        payload = rtmp_packet['payload']
+        isExHeader = (payload[0] >> 4 & 0b1000) != 0
+        frame_type = payload[0] >> 4 & 0b0111
+        codec_id = payload[0] & 0x0f
+        packetType = payload[0] & 0x0f
+        # Handle Video Data!
+
+        
     async def handle_audio_data(self, client_id, rtmp_packet):
         client_state = self.client_states[client_id]
         payload = rtmp_packet['payload']
@@ -422,15 +445,15 @@ class RTMPServer:
         self.logger.debug("Updated chunk size: %d", self.client_states[client_id].chunk_size)
 
     def handle_window_acknowledgement_size(self, client_id, payload):
-        client_state = self.client_states[client_id]
         # Handle Window Acknowledgement Size message
+        client_state = self.client_states[client_id]
         new_window_acknowledgement_size = int.from_bytes(payload, byteorder='big')
         client_state.window_acknowledgement_size = new_window_acknowledgement_size
         self.logger.debug("Updated window acknowledgement size: %d", client_state.window_acknowledgement_size)
 
     def handle_set_peer_bandwidth(self, client_id, payload):
-        client_state = self.client_states[client_id]
         # Handle Set Peer Bandwidth message
+        client_state = self.client_states[client_id]
         bandwidth = int.from_bytes(payload[:4], byteorder='big')
         limit_type = payload[4]
         client_state.peer_bandwidth = bandwidth
@@ -452,6 +475,7 @@ class RTMPServer:
         elif invoke['cmd'] == 'play':
             self.logger.debug("Received play invoke")
             await self.handle_onPlay(client_id, invoke)
+        # Need to add and support other CMDs.
         else:
             self.logger.info("Unsupported invoke command %s!", invoke['cmd'])
     
@@ -475,7 +499,6 @@ class RTMPServer:
             packet_header = common.Header(RTMP_CHANNEL_DATA, 0, len(payload), RTMP_TYPE_DATA, streamId)
             response = common.Message(packet_header, payload)
             await self.writeMessage(client_id, response)
-        
 
     async def handle_publish(self, client_id, invoke):
         client_state = self.client_states[client_id]
@@ -593,12 +616,14 @@ class RTMPServer:
         self.logger.debug("Set out chunk to %s", out_chunk_size)
 
     async def handle_bytes_read_report(self, client_id, payload):
-        bytes_read = int.from_bytes(payload, byteorder='big')
-        self.logger.debug("Bytes read: %d", bytes_read)
-        # send ACK
-        rtmpBuffer = bytearray.fromhex('02000000000004030000000000000000')
-        rtmpBuffer[12:16] = bytes_read.to_bytes(4, 'big')
-        await self.send(client_id, rtmpBuffer) 
+        # bytes_read = int.from_bytes(payload, byteorder='big')
+        # self.logger.debug("Bytes read: %d", bytes_read)
+        # # send ACK
+        # rtmpBuffer = bytearray.fromhex('02000000000004030000000000000000')
+        # rtmpBuffer[12:16] = bytes_read.to_bytes(4, 'big')
+        # await self.send(client_id, rtmpBuffer) 
+        # Just Ignore!
+        return False
         
     async def respond_connect(self, client_id, tid):
         client_state = self.client_states[client_id]
