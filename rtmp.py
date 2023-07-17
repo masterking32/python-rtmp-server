@@ -44,6 +44,8 @@ RTMP_CHANNEL_DATA = 6
 # Protocol channel ID
 PROTOCOL_CHANNEL_ID = 2
 
+MAX_CHUNK_SIZE = 10485760
+
 # Dictionary to store live users
 LiveUsers = {}
 # Dictionary to store player users
@@ -85,9 +87,8 @@ class ClientState:
         self.streamPath = ''
         self.publishStreamId = 0
         self.publishStreamPath = ''
-        self.FirstPackets = {}
         self.CacheState = 0
-        self.lastWriteHeadersForChunk = {}  # Stores the last received header information for each chunk stream ID
+        self.IncomingPackets = {}
         self.Players = {}
 
         # Meta Data
@@ -112,6 +113,9 @@ class ClientState:
         self.videoProfileName = ''
         self.videoCount = 0
         self.videoLevel = 0
+
+        self.inAckSize = 0
+        self.inLastAck = 0
 
 # RTMP server class
 class RTMPServer:
@@ -149,17 +153,8 @@ class RTMPServer:
         # Process RTMP messages
         while True:
             try:
-                chunk_full = await self.get_chunk_data(client_state.id)
-
-                if chunk_full == None:
-                    continue
-
-                rtmp_packet = self.parse_rtmp_packet(chunk_full)
-
-                if rtmp_packet == None:
-                    continue
-
-                await self.handle_rtmp_packet(client_state.id, rtmp_packet)
+                await self.get_chunk_data(client_state.id)
+                
             except asyncio.TimeoutError:
                 self.logger.debug("Connection timeout. Closing connection: %s", self.client_states[client_state.id].client_ip)
                 break
@@ -193,6 +188,7 @@ class RTMPServer:
                 del LiveUsers[app]
                 break
         
+        client_state['IncomingPackets'].clear()
         client_state.writer.close()
         await client_state.writer.wait_closed()
         self.logger.info("Client disconnected: %s", client_ip)
@@ -203,60 +199,155 @@ class RTMPServer:
         try:
             chunk_data = await client_state.reader.readexactly(1)
             if not chunk_data:
-                return None
+                raise DisconnectClientException()
+            
+            cid = chunk_data[0] & 0b00111111
+            
+            # Chunk Basic Header field may be 1, 2, or 3 bytes, depending on the chunk stream ID.
+            if cid == 0: # ChunkBasicHeader: 2
+                chunk_data += await client_state.reader.readexactly(1) # Need read 1 more packet
+                cid = 64 + chunk_data[1] # Chunk stream IDs 64-319 can be encoded in the 2-byte form of the header
+            elif cid == 1: #ChunkBasicHeader: 3
+                chunk_data += await client_state.reader.readexactly(2) # Need read 2 more packets
+                cid = (64 + chunk_data[1] + chunk_data[2]) << 8 # Chunk stream IDs 64-65599 can be encoded in the 3-byte version of this field
+
             chunk_full = bytearray(chunk_data)
             fmt = (chunk_data[0] & 0b11000000) >> 6
-            cid = chunk_data[0] & 0b00111111
 
-            if fmt == RTMP_CHUNK_TYPE_0:
-                # Full header
-                header_data = await client_state.reader.readexactly(11)
-                chunk_full += header_data
-                msg_length = int.from_bytes(header_data[3:6], byteorder='big')
-                client_state.lastWriteHeadersForChunk[cid] = {
-                    'msg_length': msg_length
-                }
-            elif fmt == RTMP_CHUNK_TYPE_1:
-                # No message stream ID
-                header_data = await client_state.reader.readexactly(7)
-                chunk_full += header_data
-                msg_length = int.from_bytes(header_data[3:6], byteorder='big')
-                client_state.lastWriteHeadersForChunk[cid] = {
-                    'msg_length': msg_length
-                }
-            elif fmt == RTMP_CHUNK_TYPE_2:
-                # No message stream ID or message length
-                header_data = await client_state.reader.readexactly(3)
-                chunk_full += header_data
-                if cid in client_state.lastWriteHeadersForChunk:
-                    msg_length = client_state.lastWriteHeadersForChunk[cid]['msg_length']
-                else:
-                    self.logger.debug("Invalid FMT 2 packet: Missing previous header information")
-                    return None
-                msg_length = len(chunk_data) + msg_length - len(header_data)
-            elif fmt == RTMP_CHUNK_TYPE_3:
-                # No header
-                self.logger.debug("FMT 3!")
-                payload = await client_state.reader.read(client_state.chunk_size)
-                chunk_full += payload
-                return chunk_full
+            if not cid in client_state.IncomingPackets:
+                client_state.IncomingPackets[cid] = self.createPacket(cid, fmt)
+            
+            # I'm afraid I suffer from memory leaks. :D
+            client_state.IncomingPackets[cid]['last_received_time'] = time.time()
+            self.clearPayloadIfTimeout(client_id, 120)
 
-            if msg_length > client_state.chunk_size:
-                payload = await client_state.reader.readexactly(client_state.chunk_size)
-                while msg_length > len(payload):
-                    remaining_length = msg_length - len(payload)
-                    await client_state.reader.readexactly(1)
-                    chunk_data = await client_state.reader.readexactly(min(client_state.chunk_size, remaining_length))
-                    payload += chunk_data
-                    remaining_length -= len(chunk_data)
-                chunk_full += payload
+            header_data = bytearray()
+             # Get Message Timestamp for FMT 0, 1, 2
+            if fmt <= RTMP_CHUNK_TYPE_2:
+                timestamp_bytes = await client_state.reader.readexactly(3)
+                header_data += timestamp_bytes
+                client_state.IncomingPackets[cid]['timestamp'] = int.from_bytes(timestamp_bytes, byteorder='big')
+                del timestamp_bytes
+
+            # Get Message Length and Message Type for FMT 0, 1
+            if fmt <= RTMP_CHUNK_TYPE_1:
+                length_bytes = await client_state.reader.readexactly(3)
+                header_data += length_bytes
+                type_bytes = await client_state.reader.readexactly(1)
+                header_data += type_bytes
+                client_state.IncomingPackets[cid]['payload_length'] = int.from_bytes(length_bytes, byteorder='big')
+                client_state.IncomingPackets[cid]['msg_type_id'] = int.from_bytes(type_bytes, byteorder='big')
+                client_state.IncomingPackets[cid]['payload'] = bytearray()
+                del length_bytes
+                del type_bytes
+            
+            # Get Message Stream ID for FMT 0
+            if fmt == RTMP_CHUNK_TYPE_0: 
+                streamID_bytes = await client_state.reader.readexactly(4)
+                header_data += streamID_bytes
+                client_state.IncomingPackets[cid]['msg_stream_id'] = int.from_bytes(streamID_bytes, byteorder='big')
+                del streamID_bytes
+            
+            chunk_full += header_data
+            
+            # Set Main Packet Headers and payload_length for FMT 0, 1
+            if fmt <= RTMP_CHUNK_TYPE_1: 
+                # client_state.IncomingPackets[cid]['basic_header'] = chunk_data
+                # client_state.IncomingPackets[cid]['header'] = header_data
+                payload_length = client_state.IncomingPackets[cid]['payload_length']
+
+            # Calculate Payload Remaining length for FMT 2,3 
+            if fmt > RTMP_CHUNK_TYPE_1:
+                payload_length = client_state.IncomingPackets[cid]['payload_length'] - len(client_state.IncomingPackets[cid]['payload'])
+
+            # Check message type id
+            if RTMP_TYPE_METADATA < client_state.IncomingPackets[cid]['msg_type_id']:
+                self.logger.error("Invalid Packet Type: %s", str(client_state.IncomingPackets[cid]['msg_type_id']))
+                raise DisconnectClientException()
+            
+            # Messages with type=3 should never have ext timestamp field according to standard. However that's not always the case in real life
+            if client_state.IncomingPackets[cid]['timestamp'] == 0xffffff:  # Max Value check (16777215), Need to read extended timestamp
+                extended_timestamp_bytes = await client_state.reader.readexactly(4)
+                chunk_full += extended_timestamp_bytes
+                client_state.IncomingPackets[cid]['extended_timestamp'] = int.from_bytes(extended_timestamp_bytes, byteorder='big')
+                del extended_timestamp_bytes
+
+            client_state.inAckSize += len(chunk_full)
+
+            self.logger.debug(f"FMT: {fmt}, CID: {cid}, Message Length: {payload_length}, Timestamp: {client_state.IncomingPackets[cid]['timestamp']}")
+
+            if payload_length > 0:
+                payload_length = min(client_state.chunk_size, payload_length)
+                payload = await client_state.reader.readexactly(payload_length)
+                client_state.inAckSize += len(payload)
+                client_state.IncomingPackets[cid]['payload'] += payload
+                del payload
             else:
-                payload = await client_state.reader.readexactly(msg_length)
-                chunk_full += payload
-            return chunk_full
-        except:
+                # I'm not sure. In some cases, I may need to disconnect the client, while in other cases, I won't. I will ignore the issue and proceed to the next packet, but I will clear the payload. If invalid data continues, it may result in a disconnection when processing subsequent packets.
+                print(f"Invalid Length (ZERO!), FMT: {fmt}, CID: {cid}, Message Length: {payload_length}, Timestamp: {client_state.IncomingPackets[cid]['timestamp']}")
+                client_state.IncomingPackets[cid]['payload'] = bytearray()
+                return
+                
+            if client_state.inAckSize >= 0xF0000000:
+                client_state.inAckSize = 0
+                client_state.inLastAck = 0
+            
+            # Delete some variables for fun!
+            del chunk_data
+            del chunk_full
+            del payload_length
+            del header_data
+
+            if len(client_state.IncomingPackets[cid]['payload']) >= client_state.IncomingPackets[cid]['payload_length']:
+                rtmp_packet = {
+                    "header": {
+                        "fmt": client_state.IncomingPackets[cid]["fmt"],
+                        "cid": client_state.IncomingPackets[cid]["cid"],
+                        "timestamp": client_state.IncomingPackets[cid]["timestamp"],
+                        "length": client_state.IncomingPackets[cid]["payload_length"],
+                        "type": client_state.IncomingPackets[cid]["msg_type_id"],
+                        "stream_id": client_state.IncomingPackets[cid]["msg_stream_id"]
+                    },
+                    "clock": 0,
+                    "payload": client_state.IncomingPackets[cid]['payload']
+                }
+                client_state.IncomingPackets[cid]['payload'] = bytearray()
+                await self.handle_rtmp_packet(client_id, rtmp_packet)
+                del rtmp_packet
+
+            # Send ACK If needed!
+            if(client_state.window_acknowledgement_size > 0 and client_state.inAckSize - client_state.inLastAck >= client_state.window_acknowledgement_size):
+                client_state.inLastAck = client_state.inAckSize
+                await self.send_ack(client_id, client_state.inAckSize)
+
+        except Exception as e:
+            self.logger.error("An error occurred: %s", str(e))
             raise DisconnectClientException()
 
+    # This function is designed to safely stop memory leaks if they exist. It ensures that memory is properly managed and prevents any potential leaks from causing issues.
+    def clearPayloadIfTimeout(self, client_id, packet_timeout=30):
+        client_state = self.client_states[client_id]
+        current_time = time.time()
+        for cid, packet in client_state.IncomingPackets.items():
+            if 'last_received_time' in packet and current_time - packet['last_received_time'] >= packet_timeout:
+                packet['payload'] = bytearray()  # Clear the payload
+
+    def createPacket(self, cid, fmt):
+        out = {}
+        out['fmt'] = fmt
+        out['cid'] = cid
+        # out['basic_header'] = bytearray()
+        # out['header'] = bytearray()
+
+        out['timestamp'] = 0
+        out['extended_timestamp'] = 0
+        out['payload_length'] = 0
+        out['msg_type_id'] = 0
+        out['msg_stream_id'] = 0
+        out['payload'] = bytearray()
+        out['last_received_time'] = time.time()
+
+        return out
 
     async def perform_handshake(self, client_id):
         # Perform the RTMP handshake with the client
@@ -287,68 +378,15 @@ class RTMPServer:
 
         self.logger.debug("Handshake done!")
 
-    def parse_rtmp_packet(self, chunk_data):
-        # Parse an RTMP packet from the chunk data
-        fmt = (chunk_data[0] & 0b11000000) >> 6
-        if fmt == RTMP_CHUNK_TYPE_0:
-            cid = chunk_data[0] & 0b00111111
-            timestamp = int.from_bytes(chunk_data[1:4], byteorder='big')
-            msg_length = int.from_bytes(chunk_data[4:7], byteorder='big')
-            msg_type_id = chunk_data[7]
-            msg_stream_id = int.from_bytes(chunk_data[8:12], byteorder='big')
-            payload = chunk_data[12:]
-        elif fmt == RTMP_CHUNK_TYPE_1:
-            cid = 0
-            timestamp = int.from_bytes(chunk_data[1:4], byteorder='big')
-            msg_length = int.from_bytes(chunk_data[4:7], byteorder='big')
-            msg_type_id = chunk_data[7]
-            msg_stream_id = 0
-            payload = chunk_data[8:]
-        elif fmt == RTMP_CHUNK_TYPE_2:
-            # Handle Type 2 chunk
-            cid = 0  # Assuming the same chunk stream ID as the previous chunk
-            timestamp = int.from_bytes(chunk_data[1:4], byteorder='big')
-            msg_length = 0  # No new message length
-            msg_type_id = 0  # No new message type ID
-            msg_stream_id = 0  # No new message stream ID
-            payload = chunk_data[4:]  # Exclude the chunk header
-        elif fmt == RTMP_CHUNK_TYPE_3:
-            # Handle Type 3 chunk
-            # No need to include any header information
-            self.logger.debug("FMT 3!")
-            return None
-        else:
-            self.logger.debug("Unsupported FMT packet!")
-            return None
-
-        # Create rtmpPacket object
-        rtmp_packet = {
-            "header": {
-                "fmt": fmt,
-                "cid": cid,
-                "timestamp": timestamp,
-                "length": msg_length,
-                "type": msg_type_id,
-                "stream_id": msg_stream_id
-            },
-            "clock": 0,
-            "payload": payload,
-            "capacity": len(payload),
-            "bytes": len(chunk_data),
-            "chunk": chunk_data
-        }
-
-        return rtmp_packet
-
     async def handle_rtmp_packet(self, client_id, rtmp_packet):
         # Handle an RTMP packet from the client
         # client_state = self.client_states[client_id]
-        self.logger.debug("Received RTMP packet:")
-        self.logger.debug("  RTMP Packet: %s", rtmp_packet)
 
         # Extract information from rtmp_packet and process as needed
         msg_type_id = rtmp_packet["header"]["type"]
         payload = rtmp_packet["payload"]
+        # self.logger.debug("Received RTMP packet:")
+        # self.logger.debug("  RTMP Packet Type: %s", msg_type_id)
     
         if msg_type_id == RTMP_TYPE_SET_CHUNK_SIZE:
             self.handle_chunk_size_message(client_id, payload)
@@ -441,6 +479,10 @@ class RTMPServer:
     def handle_chunk_size_message(self, client_id, payload):
         # Handle Chunk Size message
         new_chunk_size = int.from_bytes(payload, byteorder='big')
+        if(MAX_CHUNK_SIZE < new_chunk_size):
+            self.logger.debug("Chunk size is too big!", new_chunk_size)
+            raise DisconnectClientException()
+        
         self.client_states[client_id].chunk_size = new_chunk_size
         self.logger.debug("Updated chunk size: %d", self.client_states[client_id].chunk_size)
 
@@ -600,6 +642,13 @@ class RTMPServer:
         rtmp_buffer[12:16] = size.to_bytes(4, byteorder='big')
         await self.send(client_id, rtmp_buffer)
         self.logger.debug("Set ack to %s", size)
+
+    async def send_ack(self, client_id, size):
+        rtmp_buffer = bytes.fromhex("02000000000004030000000000000000")
+        rtmp_buffer = bytearray(rtmp_buffer)
+        rtmp_buffer[12:16] = size.to_bytes(4, byteorder='big')
+        await self.send(client_id, rtmp_buffer)
+        self.logger.debug("Send ACK: %s", size)
 
     async def set_peer_bandwidth(self, client_id, size, bandwidth_type):
         rtmp_buffer = bytes.fromhex("0200000000000506000000000000000000")
