@@ -46,6 +46,19 @@ PROTOCOL_CHANNEL_ID = 2
 
 MAX_CHUNK_SIZE = 10485760
 
+# Constants for Packet Types
+PacketTypeSequenceStart = 0  # Represents the start of a video/audio sequence
+PacketTypeCodedFrames = 1  # Represents a video/audio frame
+PacketTypeSequenceEnd = 2  # Represents the end of a video/audio sequence
+PacketTypeCodedFramesX = 3  # Represents an extended video/audio frame
+PacketTypeMetadata = 4  # Represents a packet with metadata
+PacketTypeMPEG2TSSequenceStart = 5  # Represents the start of an MPEG2-TS video/audio sequence
+
+# Constants for FourCC values
+FourCC_AV1 = b'av01'  # AV1 video codec
+FourCC_VP9 = b'vp09'  # VP9 video codec
+FourCC_HEVC = b'hvc1'  # HEVC video codec
+
 # Dictionary to store live users
 LiveUsers = {}
 # Dictionary to store player users
@@ -128,7 +141,6 @@ class RTMPServer:
         
         self.logger = logging.getLogger('RTMPServer')
         self.logger.setLevel(LogLevel)
-        self.logger.addHandler(logging.StreamHandler())
 
     async def handle_client(self, reader, writer):
         # Create a new client state for each connected client
@@ -175,23 +187,28 @@ class RTMPServer:
         
     async def disconnect(self, client_id):
         # Close the client connection
-
         client_state = self.client_states[client_id]
         if client_state.stream_mode == 'live':
             # Finish Stream for players!
-            print("NEEED DISCONNECT Players!")
+            print("NEED DISCONNECT Players!")
 
         client_ip = client_state.client_ip
-        del self.client_states[client_id]
         for app in LiveUsers:
             if LiveUsers[app]['client_id'] == client_id:
                 del LiveUsers[app]
                 break
-        
+
         client_state['IncomingPackets'].clear()
-        client_state.writer.close()
-        await client_state.writer.wait_closed()
-        self.logger.info("Client disconnected: %s", client_ip)
+
+        del self.client_states[client_id]
+        try:
+            client_state.writer.close()
+            await client_state.writer.wait_closed()
+            self.logger.info("Client disconnected: %s", client_ip)
+        except Exception as e:
+            # Handle the exception here, perform other tasks, or log the error.
+            self.logger.error(f"Error occurred while disconnecting client: {e}")
+
 
     async def get_chunk_data(self, client_id):
         # Read a chunk of data from the client
@@ -284,7 +301,7 @@ class RTMPServer:
                 del payload
             else:
                 # I'm not sure. In some cases, I may need to disconnect the client, while in other cases, I won't. I will ignore the issue and proceed to the next packet, but I will clear the payload. If invalid data continues, it may result in a disconnection when processing subsequent packets.
-                print(f"Invalid Length (ZERO!), FMT: {fmt}, CID: {cid}, Message Length: {payload_length}, Timestamp: {client_state.IncomingPackets[cid]['timestamp']}")
+                self.logger.error(f"Invalid Length (ZERO!), FMT: {fmt}, CID: {cid}, Message Length: {payload_length}, Timestamp: {client_state.IncomingPackets[cid]['timestamp']}")
                 client_state.IncomingPackets[cid]['payload'] = bytearray()
                 return
                 
@@ -430,6 +447,56 @@ class RTMPServer:
         codec_id = payload[0] & 0x0f
         packetType = payload[0] & 0x0f
         # Handle Video Data!
+        if isExHeader:
+            if packetType == PacketTypeMetadata:
+                pass
+            elif packetType == PacketTypeSequenceEnd:
+                pass
+
+            FourCC = payload[1:5]
+            if FourCC == FourCC_HEVC:
+                codec_id = 12
+                if packetType == PacketTypeSequenceStart:
+                    payload[0] = 0x1c
+                    payload[1:5] = b'\x00\x00\x00\x00'
+                elif packetType in [PacketTypeCodedFrames, PacketTypeCodedFramesX]:
+                    if packetType == PacketTypeCodedFrames:
+                        payload = payload[3:]
+                    else:
+                        payload[2:5] = b'\x00\x00\x00'
+                    payload[0] = (frame_type << 4) | 0x0c
+                    payload[1] = 1
+            elif FourCC == FourCC_AV1:
+                codec_id = 13
+                if packetType == PacketTypeSequenceStart:
+                    payload[0] = 0x1d
+                    payload[1:5] = b'\x00\x00\x00\x00'
+                elif packetType == PacketTypeMPEG2TSSequenceStart:
+                    pass
+                elif packetType == PacketTypeCodedFrames:
+                    payload[0] = (frame_type << 4) | 0x0d
+                    payload[1] = 1
+                    payload[2:5] = b'\x00\x00\x00'
+            else:
+                self.logger.debug("unsupported extension header")
+                return
+            
+        if codec_id in [7, 12, 13]:
+            if frame_type == 1 and payload[1] == 0:
+                client_state.avcSequenceHeader = bytearray(payload)
+                info = av.readAVCSpecificConfig(client_state.avcSequenceHeader)
+                client_state.videoWidth = info['width']
+                client_state.videoHeight = info['height']
+                client_state.videoProfileName = av.getAVCProfileName(info)
+                client_state.videoLevel = info['level']
+                self.logger.info("CodecID: %d, Video Level: %f, Profile Name: %s, Width: %d, Height: %d, Profile: %d",
+                         codec_id, client_state.videoLevel, client_state.videoProfileName,
+                         client_state.videoWidth, client_state.videoHeight, info['profile'])
+
+        if client_state.videoCodec == 0:
+            client_state.videoCodec = codec_id
+            client_state.videoCodecName = common.VIDEO_CODEC_NAME[codec_id]
+            self.logger.info("Codec Name: %s", client_state.videoCodecName)
 
         
     async def handle_audio_data(self, client_id, rtmp_packet):
@@ -505,7 +572,7 @@ class RTMPServer:
         if invoke['cmd'] == 'connect':
             self.logger.debug("Received connect invoke")
             await self.handle_connect_command(client_id, invoke)
-        elif invoke['cmd'] == 'releaseStream' or invoke['cmd'] == 'FCPublish' or invoke['cmd'] == 'getStreamLength':
+        elif invoke['cmd'] == 'releaseStream' or invoke['cmd'] == 'FCPublish'or invoke['cmd'] == 'FCUnpublish' or invoke['cmd'] == 'getStreamLength':
             self.logger.debug("Received %s invoke", invoke['cmd'])
             return
         elif invoke['cmd'] == 'createStream':
@@ -527,6 +594,7 @@ class RTMPServer:
             self.logger.warning("Stream not exists to play!")
             await self.sendStatusMessage(client_id, client_state.publishStreamId, "error", "NetStream.Play.BadName", "Stream not exists")
             raise DisconnectClientException()
+        
         publisher_id = LiveUsers[client_state.app]['client_id']
         publisher_client_state = self.client_states[publisher_id]
         if publisher_client_state.metaDataPayload != None:

@@ -145,18 +145,20 @@ def get_aac_profile_name(info):
         return ''
 
 def read_h264_specific_config(avc_sequence_header):
-    info = {}  # Define info as a dictionary
+    info = {}
+    profile_idc, width, height, crop_left, crop_right, crop_top, crop_bottom, frame_mbs_only, n, cf_idc, num_ref_frames = 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
     bitop = Bitop(avc_sequence_header)
     bitop.read(48)
-    info['width'] = 0  
-    info['height'] = 0  
+    info['width'] = 0
+    info['height'] = 0
+    info['level'] = 0
 
     while True:
-        info['profile'] = bitop.read(8)  
-        info['compat'] = bitop.read(8)  
-        info['level'] = bitop.read(8)  
-        info['nalu'] = (bitop.read(8) & 0x03) + 1  
-        info['nb_sps'] = bitop.read(8) & 0x1F  
+        profile_idc = bitop.read(8)
+        info['compat'] = bitop.read(8)
+        level = bitop.read(8)
+        info['nalu'] = (bitop.read(8) & 0x03) + 1
+        info['nb_sps'] = bitop.read(8) & 0x1F
         if info['nb_sps'] == 0:
             break
 
@@ -165,7 +167,6 @@ def read_h264_specific_config(avc_sequence_header):
         if bitop.read(8) != 0x67:
             break
 
-        profile_idc = bitop.read(8)
         bitop.read(8)
         bitop.read(8)
         bitop.read_golomb()
@@ -199,7 +200,7 @@ def read_h264_specific_config(avc_sequence_header):
             for n in range(num_ref_frames):
                 bitop.read_golomb()
 
-        info['avc_ref_frames'] = bitop.read_golomb()  
+        info['avc_ref_frames'] = bitop.read_golomb()
         bitop.read(1)
         width = bitop.read_golomb()
         height = bitop.read_golomb()
@@ -221,11 +222,13 @@ def read_h264_specific_config(avc_sequence_header):
             crop_top = 0
             crop_bottom = 0
 
-        info['level'] = info['level'] / 10.0  
-        info['width'] = (width + 1) * 16 - (crop_left + crop_right) * 2  
-        info['height'] = (2 - frame_mbs_only) * (height + 1) * 16 - (crop_top + crop_bottom) * 2  
+        info['profile'] = profile_idc
+        info['level'] = level / 10.0
+        info['width'] = (width + 1) * 16 - (crop_left + crop_right) * 2
+        info['height'] = (2 - frame_mbs_only) * (height + 1) * 16 - (crop_top + crop_bottom) * 2
 
     return info
+
 
 def hevc_parse_ptl(bitop, hevc, max_sub_layers_minus1):
     general_ptl = {}  # Define general_ptl as a dictionary
@@ -367,40 +370,39 @@ def read_hevc_specific_config(hevc_sequence_header):
         hevc["numTemporalLayers"] = (hevc_sequence_header[21] >> 3) & 0x07
         hevc["temporalIdNested"] = (hevc_sequence_header[21] >> 2) & 0x01
         hevc["lengthSizeMinusOne"] = hevc_sequence_header[21] & 0x03
+        num_of_arrays = hevc_sequence_header[22]
+        p = hevc_sequence_header[23:]
 
-        hevc["numOfArrays"] = hevc_sequence_header[22]
-        hevc_sequence_header = hevc_sequence_header[23:]
-
-        for i in range(hevc["numOfArrays"]):
-            if len(hevc_sequence_header) < 3:
+        for i in range(num_of_arrays):
+            if len(p) < 3:
                 break
-            hevc["array_completeness"] = (hevc_sequence_header[0] >> 7) & 0x01
-            hevc["array_nal_type"] = hevc_sequence_header[0] & 0x3F
-            hevc["numNalus"] = (hevc_sequence_header[1] << 8) | hevc_sequence_header[2]
-            hevc_sequence_header = hevc_sequence_header[3:]
+            nalutype = p[0]
+            n = (p[1] << 8) | p[2]
+            p = p[3:]
 
-            for j in range(hevc["numNalus"]):
-                if len(hevc_sequence_header) < 2:
+            for j in range(n):
+                if len(p) < 2:
                     break
-                hevc["nal_length"] = (hevc_sequence_header[0] << 8) | hevc_sequence_header[1]
-                hevc_sequence_header = hevc_sequence_header[2:]
+                k = (p[0] << 8) | p[1]
+                p = p[2:]
 
-                if len(hevc_sequence_header) < hevc["nal_length"]:
+                if len(p) < k:
                     break
-                hevc["nal_unit"] = hevc_sequence_header[:hevc["nal_length"]]
-                hevc_sequence_header = hevc_sequence_header[hevc["nal_length"]:]
-
-                if hevc["array_nal_type"] == 33:
-                    info = hevc_parse_sps(hevc["nal_unit"][4:], hevc)
+                if nalutype == 33:
+                    # SPS
+                    sps = p[:k]
+                    hevc["psps"] = hevc_parse_sps(sps, hevc)
+                    info["profile"] = hevc["general_profile_idc"]
+                    info["level"] = hevc["general_level_idc"] / 30.0
+                    info["width"] = hevc["psps"]["pic_width_in_luma_samples"] - (hevc["psps"]["conf_win_left_offset"] + hevc["psps"]["conf_win_right_offset"])
+                    info["height"] = hevc["psps"]["pic_height_in_luma_samples"] - (hevc["psps"]["conf_win_top_offset"] + hevc["psps"]["conf_win_bottom_offset"])
+                p = p[k:]
 
         break
 
-    if info["width"] != 0 and info["height"] != 0:
-        info["profile_name"] = 'HEVC-' + str(info["profile"])
-    else:
-        info["profile_name"] = ''
-
     return info
+
+
 
 def parse_flv_header(header):
     if len(header) < 13:
@@ -485,7 +487,200 @@ def parse_flv_body(data):
                     video_info['level'] = video_info['hevcSpecificConfig']['level']
                     video_info['width'] = video_info['hevcSpecificConfig']['width']
                     video_info['height'] = video_info['hevcSpecificConfig']['height']
+            elif video_info['codecID'] == 13:
+                video_info['avcPacketType'] = tag_data[1]
+                video_info['hevcSequenceHeader'] = tag_data[2:]
+                video_info['hevcSpecificConfig'] = read_hevc_specific_config(video_info['hevcSequenceHeader'])
+                video_info['codecName'] = VIDEO_CODEC_NAME[13]
+                video_info['profile'] = 0
+                video_info['level'] = 0
+                video_info['width'] = 0
+                video_info['height'] = 0
 
             tags.append(video_info)
 
     return tags
+
+def read_av1_specific_config(av1_sequence_header):
+    info = {}
+    info["width"] = 0
+    info["height"] = 0
+    info["profile"] = 0
+    info["level"] = 0
+    av1_sequence_header = av1_sequence_header[5:]
+
+    while True:
+        av1 = {}
+        if len(av1_sequence_header) < 23:
+            break
+
+        av1["seq_profile"] = av1_sequence_header[0]
+        av1["still_picture"] = (av1_sequence_header[1] >> 7) & 0x01
+        av1["reduced_still_picture_header"] = (av1_sequence_header[1] >> 6) & 0x01
+        av1["timing_info_present"] = (av1_sequence_header[1] >> 5) & 0x01
+        av1["decoder_model_info_present"] = (av1_sequence_header[1] >> 4) & 0x01
+        av1["initial_display_delay_present"] = (av1_sequence_header[1] >> 3) & 0x01
+        av1["operating_points_cnt_minus_1"] = av1_sequence_header[1] & 0x07
+        av1["decoder_model_info"] = {}
+        av1["display_model_info"] = {}
+        av1["initial_display_delay"] = {}
+
+        if av1["decoder_model_info_present"]:
+            av1["decoder_model_info"]["buffer_delay_length_minus_1"] = (av1_sequence_header[2] >> 5) & 0x07
+            av1["decoder_model_info"]["num_units_in_decoding_tick"] = (av1_sequence_header[2] & 0x1F) << 16 | av1_sequence_header[3] << 8 | av1_sequence_header[4]
+            av1["decoder_model_info"]["buffer_removal_time_length_minus_1"] = (av1_sequence_header[5] >> 5) & 0x07
+            av1["decoder_model_info"]["frame_presentation_time_length_minus_1"] = (av1_sequence_header[5] & 0x1F)
+
+        av1_sequence_header = av1_sequence_header[6:]
+
+        for i in range(av1["operating_points_cnt_minus_1"] + 1):
+            av1["operating_point_idc"] = av1_sequence_header[0]
+            av1["seq_level_idx"] = av1_sequence_header[1]
+
+            if av1["decoder_model_info_present"]:
+                av1["seq_tier"] = av1_sequence_header[2] >> 7
+                av1["decoder_model_present_for_this_op"] = (av1_sequence_header[2] >> 6) & 0x01
+                av1["initial_display_delay_present_for_this_op"] = (av1_sequence_header[2] >> 5) & 0x01
+                av1_sequence_header = av1_sequence_header[3:]
+            else:
+                av1_sequence_header = av1_sequence_header[2:]
+
+            if av1["initial_display_delay_present_for_this_op"]:
+                av1["initial_display_delay"]["initial_display_delay_minus_1"] = ((av1_sequence_header[0] & 0x3F) << 16) | (av1_sequence_header[1] << 8) | av1_sequence_header[2]
+                av1_sequence_header = av1_sequence_header[3:]
+
+            av1["frame_width_bits_minus_1"] = (av1_sequence_header[0] >> 4) & 0x0F
+            av1["frame_height_bits_minus_1"] = av1_sequence_header[0] & 0x0F
+            av1["max_frame_width_minus_1"] = ((av1_sequence_header[1] & 0x7F) << 8) | av1_sequence_header[2]
+            av1["max_frame_height_minus_1"] = ((av1_sequence_header[3] & 0x7F) << 8) | av1_sequence_header[4]
+
+            info["width"] = av1["max_frame_width_minus_1"] + 1
+            info["height"] = av1["max_frame_height_minus_1"] + 1
+            info["profile"] = av1["seq_profile"]
+            info["level"] = av1["seq_level_idx"] / 8.0
+
+            av1_sequence_header = av1_sequence_header[5:]
+
+        break
+
+    return info
+
+
+def readAVCSpecificConfig(avcSequenceHeader):
+    codec_id = avcSequenceHeader[0] & 0x0f
+
+    if codec_id == 7:
+        return read_h264_specific_config(avcSequenceHeader)
+    elif codec_id == 12:
+        return read_hevc_specific_config(avcSequenceHeader)
+    elif codec_id == 13:
+        return read_av1_specific_config(avcSequenceHeader)
+    
+def getAVCProfileName(info):
+    profile = info['profile']
+    if profile == 1:
+        return 'Main'
+    elif profile == 2:
+        return 'Main 10'
+    elif profile == 3:
+        return 'Main Still Picture'
+    elif profile == 66:
+        return 'Baseline'
+    elif profile == 77:
+        return 'Main'
+    elif profile == 100:
+        return 'High'
+    else:
+        return ''
+
+def SimpleGetVideoInfo(avcSequenceHeader):
+    # Determine codec based on codec ID
+    codec_id = avcSequenceHeader[0] & 0x0f
+    info = {}
+    info['codec_id'] = codec_id
+    info['codec'] = None
+    info['profile_name'] = None
+    info['video_level'] = None
+    info['width'] = None
+    info['height'] = None
+
+    if codec_id == 7:
+        # H.264 codec
+        profile_name = avcSequenceHeader[5]  # Extract profile name
+        video_level = avcSequenceHeader[6]  # Extract video level
+        width = (avcSequenceHeader[7] << 8) | avcSequenceHeader[8]  # Extract width
+        height = (avcSequenceHeader[9] << 8) | avcSequenceHeader[10]  # Extract height
+        info['codec'] = 'H.264'
+        info['profile_name'] = profile_name
+        info['video_level'] = video_level
+        info['width'] = width
+        info['height'] = height
+    elif codec_id == 12:
+        # HEVC (H.265) codec
+        profile_name = avcSequenceHeader[5]  # Extract profile name
+        video_level = avcSequenceHeader[6]  # Extract video level
+        width = ((avcSequenceHeader[16] & 0x03) << 8) | avcSequenceHeader[17]  # Extract width
+        height = ((avcSequenceHeader[18] & 0xF8) << 5) | ((avcSequenceHeader[19] & 0xF8) >> 3)  # Extract height
+        info['codec'] = 'HEVC (H.265)'
+        info['profile_name'] = profile_name
+        info['video_level'] = video_level
+        info['width'] = width
+        info['height'] = height
+    elif codec_id == 13:
+        # VP9 codec
+        profile_name = avcSequenceHeader[5]  # Extract profile name
+        video_level = avcSequenceHeader[6]  # Extract video level
+        width = ((avcSequenceHeader[16] & 0x3F) << 8) | avcSequenceHeader[17]  # Extract width
+        height = ((avcSequenceHeader[18] & 0x3F) << 8) | avcSequenceHeader[19]  # Extract height
+        info['codec'] = 'VP9'
+        info['profile_name'] = profile_name
+        info['video_level'] = video_level
+        info['width'] = width
+        info['height'] = height
+    elif codec_id == 176:
+        # AV1 (AOM AV1 or STV-av1) codec
+        profile_name = avcSequenceHeader[5]  # Extract profile name
+        video_level = avcSequenceHeader[6]  # Extract video level
+        width = ((avcSequenceHeader[18] & 0x3F) << 8) | avcSequenceHeader[19]  # Extract width
+        height = ((avcSequenceHeader[16] & 0x3F) << 8) | avcSequenceHeader[17]  # Extract height
+        info['codec'] = 'AV1 (AOM AV1 or STV-av1)'
+        info['profile_name'] = profile_name
+        info['video_level'] = video_level
+        info['width'] = width
+        info['height'] = height
+    elif codec_id == 32:
+        # QuickTime codec (H.264)
+        width = (avcSequenceHeader[5] << 8) | avcSequenceHeader[6]  # Extract width
+        height = (avcSequenceHeader[7] << 8) | avcSequenceHeader[8]  # Extract height
+        info['codec'] = 'QuickTime (H.264)'
+        info['width'] = width
+        info['height'] = height
+    elif codec_id == 4:
+        # MPEG-4 codec
+        width = (avcSequenceHeader[5] << 8) | avcSequenceHeader[6]  # Extract width
+        height = (avcSequenceHeader[7] << 8) | avcSequenceHeader[8]  # Extract height
+        info['codec'] = 'MPEG-4'
+        info['width'] = width
+        info['height'] = height
+    elif codec_id == 27:
+        # x264 codec
+        profile_name = avcSequenceHeader[5]  # Extract profile name
+        video_level = avcSequenceHeader[6]  # Extract video level
+        width = (avcSequenceHeader[7] << 8) | avcSequenceHeader[8]  # Extract width
+        height = (avcSequenceHeader[9] << 8) | avcSequenceHeader[10]  # Extract height
+        info['codec'] = 'x264'
+        info['profile_name'] = profile_name
+        info['video_level'] = video_level
+        info['width'] = width
+        info['height'] = height
+    elif codec_id == 33:
+        # MP4 codec
+        width = (avcSequenceHeader[5] << 8) | avcSequenceHeader[6]  # Extract width
+        height = (avcSequenceHeader[7] << 8) | avcSequenceHeader[8]  # Extract height
+        info['codec'] = 'MP4'
+        info['width'] = width
+        info['height'] = height
+    else:
+        info['codec'] = f"Unknown codec ID: {codec_id}"
+    
+    return info
